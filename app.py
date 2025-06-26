@@ -5,108 +5,83 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import sys
+import atexit
 
 # --- App Configuration ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- Storage & State Configuration ---
-VOLUME_PATH = '/data'
+# Render-এর Persistent Disk /data-তে মাউন্ট করা হয়েছে
+VOLUME_PATH = '/data' 
 VIDEO_STORAGE_PATH = os.path.join(VOLUME_PATH, 'videos')
 if not os.path.exists(VIDEO_STORAGE_PATH):
     os.makedirs(VIDEO_STORAGE_PATH)
+    logging.info(f"Created video storage directory at: {VIDEO_STORAGE_PATH}")
 
-# চলমান স্ট্রিমগুলোর তথ্য রাখার জন্য একটি গ্লোবাল ডিকশনারি
-# Key: filename, Value: subprocess.Popen object
+# Key: slot_id (e.g., 'slot-1'), Value: { 'process': Popen object, 'filename': 'video.mp4' }
 running_streams = {}
 
 # --- Helper Functions ---
-def start_ffmpeg_process(video_path, rtmp_url):
-    command = [
-        'ffmpeg', '-re', '-stream_loop', '-1', '-i', video_path,
-        '-c:v', 'libx264', '-preset', 'veryfast', '-maxrate', '3000k',
-        '-bufsize', '6000k', '-pix_fmt', 'yuv420p', '-g', '50',
-        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
-        '-f', 'flv', rtmp_url
-    ]
-    # FFmpeg প্রসেসটিকে সম্পূর্ণ ব্যাকগ্রাউন্ডে চালানো
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return process
-
-def stop_ffmpeg_process(process):
-    if process:
-        process.terminate() # FFmpeg প্রসেসটি বন্ধ করা
+def cleanup_process(process):
+    """Safely terminate a running FFmpeg process."""
+    if process and process.poll() is None:
+        logging.info(f"Terminating FFmpeg process {process.pid}")
+        process.terminate()
         try:
-            process.wait(timeout=5) # প্রসেসটি বন্ধ হওয়ার জন্য ৫ সেকেন্ড অপেক্ষা করা
+            process.wait(timeout=5)
+            logging.info(f"Process {process.pid} terminated gracefully.")
         except subprocess.TimeoutExpired:
-            process.kill() # যদি বন্ধ না হয়, তাহলে জোর করে বন্ধ করা
-        return True
-    return False
+            logging.warning(f"Process {process.pid} did not terminate gracefully, killing.")
+            process.kill()
+
+@atexit.register
+def cleanup_all_streams():
+    """Ensure all FFmpeg processes are terminated when the app exits or restarts."""
+    logging.info("Application shutting down. Cleaning up all active streams.")
+    for slot_id, stream_info in list(running_streams.items()):
+        logging.info(f"Stopping stream for {slot_id} on shutdown.")
+        cleanup_process(stream_info.get('process'))
 
 # --- Routes ---
 @app.route('/')
 def health_check():
-    return jsonify({"status": "ok", "message": "Backend v6 (Stateful Streaming) is running!"})
-
-@app.route('/upload', methods=['POST'])
-def upload_video():
-    # এই অংশটি অপরিবর্তিত
-    try:
-        if 'video' not in request.files or 'uid' not in request.form:
-            return jsonify({"error": "Missing video file or user ID."}), 400
-        video_file = request.files['video']
-        uid = request.form.get('uid')
-        if video_file.filename == '':
-            return jsonify({"error": "No selected file."}), 400
-        filename = f"{uid}__{secure_filename(video_file.filename)}"
-        save_path = os.path.join(VIDEO_STORAGE_PATH, filename)
-        video_file.save(save_path)
-        return jsonify({"message": "Video uploaded successfully!", "filename": filename}), 200
-    except Exception as e:
-        logging.error(f"Error in /upload: {e}", exc_info=True)
-        return jsonify({"error": "Internal server error during upload."}), 500
-
-@app.route('/videos/<uid>', methods=['GET'])
-def get_videos(uid):
-    # এই অংশটি অপরিবর্তিত
-    try:
-        user_videos = []
-        for filename in os.listdir(VIDEO_STORAGE_PATH):
-            if filename.startswith(f"{uid}__"):
-                original_name = filename.split('__', 1)[1]
-                user_videos.append({"id": filename, "name": original_name})
-        return jsonify(user_videos), 200
-    except Exception as e:
-        logging.error(f"Error in /videos: {e}", exc_info=True)
-        return jsonify({"error": "Could not list videos."}), 500
+    return jsonify({"status": "ok", "message": "Backend v11 (Final Multi-Stream) is running!"})
 
 @app.route('/stream/start', methods=['POST'])
 def start_stream():
     try:
-        filename = request.form.get('filename')
-        if filename in running_streams:
-            return jsonify({"error": "This video is already streaming."}), 409
-
+        # FormData থেকে ডেটা গ্রহণ
+        slot_id = request.form.get('slot_id')
+        video_file = request.files.get('video')
         stream_url = request.form.get('stream_url')
         stream_key = request.form.get('stream_key')
-        if not all([filename, stream_url, stream_key]):
-            return jsonify({"error": "Missing required streaming parameters."}), 400
-        
-        video_path = os.path.join(VIDEO_STORAGE_PATH, filename)
-        if not os.path.exists(video_path):
-             return jsonify({"error": f"Video file not found: {filename}"}), 404
 
+        if not all([slot_id, video_file, stream_url, stream_key]):
+            return jsonify({"error": "Missing required parameters (slot_id, video, stream_url, stream_key)."}), 400
+
+        if slot_id in running_streams and running_streams[slot_id]['process'].poll() is None:
+            return jsonify({"error": f"Slot {slot_id} is already streaming."}), 409
+
+        # ভিডিও ফাইলটি সেভ করা
+        filename = f"{slot_id}__{secure_filename(video_file.filename)}"
+        video_path = os.path.join(VIDEO_STORAGE_PATH, filename)
+        video_file.save(video_path)
+        logging.info(f"Video for {slot_id} saved to {video_path}")
+
+        # FFmpeg কমান্ড তৈরি এবং চালু করা (আলট্রা ফাস্ট)
         full_rtmp_url = f"{stream_url.strip()}/{stream_key.strip()}"
-        process = start_ffmpeg_process(video_path, full_rtmp_url)
-        running_streams[filename] = process
+        command = ['ffmpeg', '-re', '-stream_loop', '-1', '-i', video_path, '-c', 'copy', '-f', 'flv', full_rtmp_url]
         
-        logging.info(f"Stream started for '{filename}'. Process ID: {process.pid}")
-        return jsonify({"message": f"Stream for '{filename}' has started successfully!"}), 200
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # চলমান স্ট্রিমের তথ্য সেভ করা
+        running_streams[slot_id] = {'process': process, 'filename': filename}
+        
+        logging.info(f"Stream started for {slot_id} with video {filename}. PID: {process.pid}")
+        return jsonify({"message": f"Stream for Slot {slot_id.split('-')[1]} has started successfully!"}), 200
+
     except Exception as e:
         logging.error(f"Error in /stream/start: {e}", exc_info=True)
         return jsonify({"error": "Internal server error while starting stream."}), 500
@@ -114,24 +89,41 @@ def start_stream():
 @app.route('/stream/stop', methods=['POST'])
 def stop_stream():
     try:
-        filename = request.form.get('filename')
-        if filename not in running_streams:
+        slot_id = request.form.get('slot_id')
+        if not slot_id:
+            return jsonify({"error": "Missing slot_id."}), 400
+
+        stream_info = running_streams.pop(slot_id, None)
+        if not stream_info:
             return jsonify({"error": "Stream not found or already stopped."}), 404
         
-        process = running_streams.pop(filename) # তালিকা থেকে মুছে ফেলা
-        if stop_ffmpeg_process(process):
-            logging.info(f"Stream stopped for '{filename}'.")
-            return jsonify({"message": f"Stream for '{filename}' has been stopped."}), 200
-        else:
-            return jsonify({"error": "Could not stop the stream process."}), 500
+        # স্ট্রিম প্রসেসটি বন্ধ করা
+        cleanup_process(stream_info['process'])
+        logging.info(f"Stream stopped for {slot_id}.")
+
+        # ভিডিও ফাইলটি সার্ভার থেকে ডিলিট করা
+        video_path = os.path.join(VIDEO_STORAGE_PATH, stream_info['filename'])
+        if os.path.exists(video_path):
+            os.remove(video_path)
+            logging.info(f"Deleted video file: {video_path}")
+
+        return jsonify({"message": f"Stream for Slot {slot_id.split('-')[1]} has been stopped."}), 200
     except Exception as e:
         logging.error(f"Error in /stream/stop: {e}", exc_info=True)
         return jsonify({"error": "Internal server error while stopping stream."}), 500
 
 @app.route('/stream/status', methods=['GET'])
 def stream_status():
-    # বর্তমানে কোন কোন ভিডিও লাইভ চলছে তার তালিকা পাঠানো
-    active_streams = list(running_streams.keys())
+    active_streams = []
+    # চেক করা যে কোন কোন প্রসেস এখনো চলছে
+    for slot_id, stream_info in list(running_streams.items()):
+        if stream_info['process'].poll() is None:
+            active_streams.append(slot_id)
+        else:
+            # যদি কোনো স্ট্রিম নিজে থেকে বন্ধ হয়ে যায়, তাহলে তালিকা থেকে মুছে ফেলা
+            logging.info(f"Stream for {slot_id} found to be finished. Cleaning up.")
+            del running_streams[slot_id]
+            
     return jsonify({"active_streams": active_streams}), 200
 
 if __name__ == '__main__':
